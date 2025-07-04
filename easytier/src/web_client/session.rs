@@ -9,11 +9,12 @@ use tokio::{
 use crate::{
     common::{constants::EASYTIER_VERSION, get_machine_id},
     proto::{
+        common::Uuid,
         rpc_impl::bidirect::BidirectRpcManager,
         rpc_types::controller::BaseController,
         web::{
-            HeartbeatRequest, HeartbeatResponse, WebClientServiceServer,
-            WebServerServiceClientFactory,
+            DeleteNetworkInstanceRequest, HeartbeatRequest, HeartbeatResponse, WebClientService,
+            WebClientServiceServer, WebServerServiceClientFactory,
         },
     },
     tunnel::Tunnel,
@@ -130,7 +131,7 @@ impl Session {
         self.tasks.lock().await.abort_all();
     }
 
-    pub async fn wait(&mut self) {
+    pub async fn wait(&self) {
         tokio::select! {
             _ = self.rpc_mgr.wait() => {}
             _ = self.wait_routines() => {}
@@ -140,5 +141,20 @@ impl Session {
     pub async fn wait_next_heartbeat(&self) -> Option<HeartbeatResponse> {
         let mut rx = self.heartbeat_ctx.notifier.subscribe();
         rx.recv().await.ok()
+    }
+
+    pub async fn shutdown(&self) {
+
+        let inst_ids = self.controller.list_network_instance_ids();
+        _ = self
+            .controller
+            .delete_network_instance(
+                BaseController::default(),
+                DeleteNetworkInstanceRequest {
+                    inst_ids: inst_ids.into_iter().map(Uuid::from).collect(),
+                },
+            )
+            .await;
+
     }
 }
