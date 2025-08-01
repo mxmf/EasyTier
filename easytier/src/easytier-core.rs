@@ -12,8 +12,9 @@ use std::{
 
 use anyhow::Context;
 use cidr::IpCidr;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
+use clap_complete::Shell;
 use easytier::{
     common::{
         config::{
@@ -44,7 +45,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_MIMALLOC: MiMalloc = MiMalloc;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
 
 #[cfg(feature = "jemalloc")]
@@ -52,7 +53,7 @@ use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn set_prof_active(_active: bool) {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
         let name = PROF_ACTIVE.name();
@@ -61,7 +62,7 @@ fn set_prof_active(_active: bool) {
 }
 
 fn dump_profile(_cur_allocated: usize) {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         const PROF_DUMP: &'static [u8] = b"prof.dump\0";
         static mut PROF_DUMP_FILE_NAME: [u8; 128] = [0; 128];
@@ -122,6 +123,9 @@ struct Cli {
 
     #[command(flatten)]
     logging_options: LoggingOptions,
+
+    #[clap(long, help = t!("core_clap.generate_completions").to_string())]
+    gen_autocomplete: Option<Shell>,
 }
 
 #[derive(Parser, Debug)]
@@ -502,6 +506,22 @@ struct NetworkOptions {
         help = t!("core_clap.foreign_relay_bps_limit").to_string(),
     )]
     foreign_relay_bps_limit: Option<u64>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "TCP port whitelist. Supports single ports (80) and ranges (8000-9000)",
+        num_args = 0..
+    )]
+    tcp_whitelist: Vec<String>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "UDP port whitelist. Supports single ports (53) and ranges (5000-6000)",
+        num_args = 0..
+    )]
+    udp_whitelist: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -810,7 +830,6 @@ impl NetworkOptions {
         if let Some(dev_name) = &self.dev_name {
             f.dev_name = dev_name.clone()
         }
-        println!("mtu: {}, {:?}", f.mtu, self.mtu);
         if let Some(mtu) = self.mtu {
             f.mtu = mtu as u32;
         }
@@ -856,6 +875,14 @@ impl NetworkOptions {
         if !self.exit_nodes.is_empty() {
             cfg.set_exit_nodes(self.exit_nodes.clone());
         }
+
+        let mut old_tcp_whitelist = cfg.get_tcp_whitelist();
+        old_tcp_whitelist.extend(self.tcp_whitelist.clone());
+        cfg.set_tcp_whitelist(old_tcp_whitelist);
+
+        let mut old_udp_whitelist = cfg.get_udp_whitelist();
+        old_udp_whitelist.extend(self.udp_whitelist.clone());
+        cfg.set_udp_whitelist(old_udp_whitelist);
 
         Ok(())
     }
@@ -1084,6 +1111,14 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 
     tokio::select! {
         _ = manager.wait() => {
+            let infos = manager.collect_network_infos()?;
+            let errs = infos
+                .into_values()
+                .filter_map(|info| info.error_msg)
+                .collect::<Vec<_>>();
+            if errs.len() > 0 {
+                return Err(anyhow::anyhow!("some instances stopped with errors"));
+            }
         }
         _ = tokio::signal::ctrl_c() => {
             println!("ctrl-c received, exiting...");
@@ -1093,7 +1128,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn memory_monitor() {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         let mut last_peak_size = 0;
         let e = epoch::mib().unwrap();
@@ -1158,6 +1193,11 @@ async fn main() -> ExitCode {
     let _monitor = std::thread::spawn(memory_monitor);
 
     let cli = Cli::parse();
+    if let Some(shell) = cli.gen_autocomplete {
+        let mut cmd = Cli::command();
+        easytier::print_completions(shell, &mut cmd, "easytier-core");
+        return ExitCode::SUCCESS;
+    }
     let mut ret_code = 0;
 
     if let Err(e) = run_main(cli).await {

@@ -191,9 +191,8 @@ impl EasyTierLauncher {
                     };
                     *data_c.my_node_info.write().unwrap() = node_info.clone();
                     *data_c.routes.write().unwrap() = peer_mgr_c.list_routes().await;
-                    *data_c.peers.write().unwrap() = PeerManagerRpcService::new(peer_mgr_c.clone())
-                        .list_peers()
-                        .await;
+                    *data_c.peers.write().unwrap() =
+                        PeerManagerRpcService::list_peers(&peer_mgr_c).await;
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
@@ -678,6 +677,10 @@ impl NetworkConfig {
             flags.use_smoltcp = use_smoltcp;
         }
 
+        if let Some(disable_ipv6) = self.disable_ipv6 {
+            flags.enable_ipv6 = !disable_ipv6;
+        }
+
         if let Some(enable_kcp_proxy) = self.enable_kcp_proxy {
             flags.enable_kcp_proxy = enable_kcp_proxy;
         }
@@ -853,6 +856,7 @@ impl NetworkConfig {
         result.latency_first = Some(flags.latency_first);
         result.dev_name = Some(flags.dev_name.clone());
         result.use_smoltcp = Some(flags.use_smoltcp);
+        result.disable_ipv6 = Some(!flags.enable_ipv6);
         result.enable_kcp_proxy = Some(flags.enable_kcp_proxy);
         result.disable_kcp_input = Some(flags.disable_kcp_input);
         result.enable_quic_proxy = Some(flags.enable_quic_proxy);
@@ -1096,6 +1100,7 @@ mod tests {
                 flags.latency_first = rng.gen_bool(0.5);
                 flags.dev_name = format!("etun{}", rng.gen_range(0..10));
                 flags.use_smoltcp = rng.gen_bool(0.3);
+                flags.enable_ipv6 = rng.gen_bool(0.8);
                 flags.enable_kcp_proxy = rng.gen_bool(0.5);
                 flags.disable_kcp_input = rng.gen_bool(0.3);
                 flags.enable_quic_proxy = rng.gen_bool(0.5);

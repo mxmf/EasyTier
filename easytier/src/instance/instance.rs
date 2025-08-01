@@ -10,6 +10,7 @@ use cidr::{IpCidr, Ipv4Inet};
 use tokio::{sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::common::acl_processor::AclRuleBuilder;
 use crate::common::config::ConfigLoader;
 use crate::common::error::Error;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx, GlobalCtxEvent};
@@ -29,8 +30,15 @@ use crate::peers::peer_manager::{PeerManager, RouteAlgoType};
 use crate::peers::rpc_service::PeerManagerRpcService;
 use crate::peers::{create_packet_recv_chan, recv_packet_from_chan, PacketRecvChanReceiver};
 use crate::proto::cli::VpnPortalRpc;
+use crate::proto::cli::{
+    AddPortForwardRequest, AddPortForwardResponse, ListMappedListenerRequest,
+    ListMappedListenerResponse, ListPortForwardRequest, ListPortForwardResponse,
+    ManageMappedListenerRequest, ManageMappedListenerResponse, MappedListener,
+    MappedListenerManageAction, MappedListenerManageRpc, PortForwardManageRpc,
+    RemovePortForwardRequest, RemovePortForwardResponse,
+};
 use crate::proto::cli::{GetVpnPortalInfoRequest, GetVpnPortalInfoResponse, VpnPortalInfo};
-use crate::proto::common::TunnelInfo;
+use crate::proto::common::{PortForwardConfigPb, TunnelInfo};
 use crate::proto::peer_rpc::PeerCenterRpcServer;
 use crate::proto::rpc_impl::standalone::{RpcServerHook, StandAloneServer};
 use crate::proto::rpc_types;
@@ -266,6 +274,8 @@ impl Instance {
             global_ctx.clone(),
             peer_packet_sender.clone(),
         ));
+
+        peer_manager.set_allow_loopback_tunnel(false);
 
         let listener_manager = Arc::new(Mutex::new(ListenerManager::new(
             global_ctx.clone(),
@@ -519,6 +529,19 @@ impl Instance {
         });
     }
 
+    async fn run_quic_dst(&mut self) -> Result<(), Error> {
+        if !self.global_ctx.get_flags().enable_quic_proxy {
+            return Ok(());
+        }
+
+        let quic_dst = QUICProxyDst::new(self.global_ctx.clone())?;
+        quic_dst.start().await?;
+        self.global_ctx
+            .set_quic_proxy_port(Some(quic_dst.local_addr()?.port()));
+        self.quic_proxy_dst = Some(quic_dst);
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> Result<(), Error> {
         self.listener_manager
             .lock()
@@ -581,12 +604,17 @@ impl Instance {
         }
 
         if !self.global_ctx.get_flags().disable_quic_input {
-            let quic_dst = QUICProxyDst::new(self.global_ctx.clone())?;
-            quic_dst.start().await?;
-            self.global_ctx
-                .set_quic_proxy_port(Some(quic_dst.local_addr()?.port()));
-            self.quic_proxy_dst = Some(quic_dst);
+            if let Err(e) = self.run_quic_dst().await {
+                eprintln!(
+                    "quic input start failed: {:?} (some platforms may not support)",
+                    e
+                );
+            }
         }
+
+        self.global_ctx
+            .get_acl_filter()
+            .reload_rules(AclRuleBuilder::build(&self.global_ctx)?.as_ref());
 
         // run after tun device created, so listener can bind to tun device, which may be required by win 10
         self.ip_proxy = Some(IpProxy::new(
@@ -715,6 +743,135 @@ impl Instance {
         }
     }
 
+    fn get_mapped_listener_manager_rpc_service(
+        &self,
+    ) -> impl MappedListenerManageRpc<Controller = BaseController> + Clone {
+        #[derive(Clone)]
+        pub struct MappedListenerManagerRpcService(Arc<GlobalCtx>);
+
+        #[async_trait::async_trait]
+        impl MappedListenerManageRpc for MappedListenerManagerRpcService {
+            type Controller = BaseController;
+
+            async fn list_mapped_listener(
+                &self,
+                _: BaseController,
+                _request: ListMappedListenerRequest,
+            ) -> Result<ListMappedListenerResponse, rpc_types::error::Error> {
+                let mut ret = ListMappedListenerResponse::default();
+                let urls = self.0.config.get_mapped_listeners();
+                let mapped_listeners: Vec<MappedListener> = urls
+                    .into_iter()
+                    .map(|u| MappedListener {
+                        url: Some(u.into()),
+                    })
+                    .collect();
+                ret.mappedlisteners = mapped_listeners;
+                Ok(ret)
+            }
+
+            async fn manage_mapped_listener(
+                &self,
+                _: BaseController,
+                req: ManageMappedListenerRequest,
+            ) -> Result<ManageMappedListenerResponse, rpc_types::error::Error> {
+                let url: url::Url = req.url.ok_or(anyhow::anyhow!("url is empty"))?.into();
+
+                let urls = self.0.config.get_mapped_listeners();
+                let mut set_urls: HashSet<url::Url> = urls.into_iter().collect();
+                if req.action == MappedListenerManageAction::MappedListenerRemove as i32 {
+                    set_urls.remove(&url);
+                } else if req.action == MappedListenerManageAction::MappedListenerAdd as i32 {
+                    set_urls.insert(url);
+                }
+                let urls: Vec<url::Url> = set_urls.into_iter().collect();
+                self.0.config.set_mapped_listeners(Some(urls));
+                Ok(ManageMappedListenerResponse::default())
+            }
+        }
+
+        MappedListenerManagerRpcService(self.global_ctx.clone())
+    }
+
+    fn get_port_forward_manager_rpc_service(
+        &self,
+    ) -> impl PortForwardManageRpc<Controller = BaseController> + Clone {
+        #[derive(Clone)]
+        pub struct PortForwardManagerRpcService {
+            global_ctx: ArcGlobalCtx,
+            socks5_server: Weak<Socks5Server>,
+        }
+
+        #[async_trait::async_trait]
+        impl PortForwardManageRpc for PortForwardManagerRpcService {
+            type Controller = BaseController;
+
+            async fn add_port_forward(
+                &self,
+                _: BaseController,
+                request: AddPortForwardRequest,
+            ) -> Result<AddPortForwardResponse, rpc_types::error::Error> {
+                let Some(socks5_server) = self.socks5_server.upgrade() else {
+                    return Err(anyhow::anyhow!("socks5 server not available").into());
+                };
+                if let Some(cfg) = request.cfg {
+                    tracing::info!("Port forward rule added: {:?}", cfg);
+                    let mut current_forwards = self.global_ctx.config.get_port_forwards();
+                    current_forwards.push(cfg.into());
+                    self.global_ctx
+                        .config
+                        .set_port_forwards(current_forwards.clone());
+                    socks5_server
+                        .reload_port_forwards(&current_forwards)
+                        .await
+                        .with_context(|| "Failed to reload port forwards")?;
+                }
+                Ok(AddPortForwardResponse {})
+            }
+
+            async fn remove_port_forward(
+                &self,
+                _: BaseController,
+                request: RemovePortForwardRequest,
+            ) -> Result<RemovePortForwardResponse, rpc_types::error::Error> {
+                let Some(socks5_server) = self.socks5_server.upgrade() else {
+                    return Err(anyhow::anyhow!("socks5 server not available").into());
+                };
+                let Some(cfg) = request.cfg else {
+                    return Err(anyhow::anyhow!("port forward config is empty").into());
+                };
+                let cfg = cfg.into();
+                let mut current_forwards = self.global_ctx.config.get_port_forwards();
+                current_forwards.retain(|e| *e != cfg);
+                self.global_ctx
+                    .config
+                    .set_port_forwards(current_forwards.clone());
+                socks5_server
+                    .reload_port_forwards(&current_forwards)
+                    .await
+                    .with_context(|| "Failed to reload port forwards")?;
+
+                tracing::info!("Port forward rule removed: {:?}", cfg);
+                Ok(RemovePortForwardResponse {})
+            }
+
+            async fn list_port_forward(
+                &self,
+                _: BaseController,
+                _request: ListPortForwardRequest,
+            ) -> Result<ListPortForwardResponse, rpc_types::error::Error> {
+                let forwards = self.global_ctx.config.get_port_forwards();
+                let cfgs: Vec<PortForwardConfigPb> = forwards.into_iter().map(Into::into).collect();
+                Ok(ListPortForwardResponse { cfgs })
+            }
+        }
+
+        PortForwardManagerRpcService {
+            global_ctx: self.global_ctx.clone(),
+            socks5_server: Arc::downgrade(&self.socks5_server),
+        }
+    }
+
     async fn run_rpc_server(&mut self) -> Result<(), Error> {
         let Some(_) = self.global_ctx.config.get_rpc_portal() else {
             tracing::info!("rpc server not enabled, because rpc_portal is not set.");
@@ -727,12 +884,15 @@ impl Instance {
         let conn_manager = self.conn_manager.clone();
         let peer_center = self.peer_center.clone();
         let vpn_portal_rpc = self.get_vpn_portal_rpc_service();
+        let mapped_listener_manager_rpc = self.get_mapped_listener_manager_rpc_service();
+        let port_forward_manager_rpc = self.get_port_forward_manager_rpc_service();
 
         let s = self.rpc_server.as_mut().unwrap();
-        s.registry().register(
-            PeerManageRpcServer::new(PeerManagerRpcService::new(peer_mgr)),
-            "",
-        );
+        let peer_mgr_rpc_service = PeerManagerRpcService::new(peer_mgr.clone());
+        s.registry()
+            .register(PeerManageRpcServer::new(peer_mgr_rpc_service.clone()), "");
+        s.registry()
+            .register(AclManageRpcServer::new(peer_mgr_rpc_service), "");
         s.registry().register(
             ConnectorManageRpcServer::new(ConnectorManagerRpcService(conn_manager)),
             "",
@@ -742,6 +902,14 @@ impl Instance {
             .register(PeerCenterRpcServer::new(peer_center.get_rpc_service()), "");
         s.registry()
             .register(VpnPortalRpcServer::new(vpn_portal_rpc), "");
+        s.registry().register(
+            MappedListenerManageRpcServer::new(mapped_listener_manager_rpc),
+            "",
+        );
+        s.registry().register(
+            PortForwardManageRpcServer::new(port_forward_manager_rpc),
+            "",
+        );
 
         if let Some(ip_proxy) = self.ip_proxy.as_ref() {
             s.registry().register(

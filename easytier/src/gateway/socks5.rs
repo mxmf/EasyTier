@@ -6,11 +6,12 @@ use std::{
 
 use crossbeam::atomic::AtomicCell;
 use kcp_sys::{endpoint::KcpEndpoint, stream::KcpStream};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     common::{
         config::PortForwardConfig, global_ctx::GlobalCtxEvent, join_joinset_background,
-        scoped_task::ScopedTask,
+        netns::NetNS, scoped_task::ScopedTask,
     },
     gateway::{
         fast_socks5::{
@@ -23,7 +24,10 @@ use crate::{
         kcp_proxy::NatDstKcpConnector,
         tokio_smoltcp::{channel_device, BufferSize, Net, NetConfig},
     },
-    tunnel::packet_def::{PacketType, ZCPacket},
+    tunnel::{
+        common::setup_sokcet2,
+        packet_def::{PacketType, ZCPacket},
+    },
 };
 use anyhow::Context;
 use dashmap::DashMap;
@@ -32,8 +36,7 @@ use pnet::packet::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-    net::UdpSocket,
+    net::{TcpListener, TcpSocket, UdpSocket},
     select,
     sync::{mpsc, Mutex},
     task::JoinSet,
@@ -250,6 +253,38 @@ impl AsyncTcpConnector for Socks5KcpConnector {
     }
 }
 
+fn bind_tcp_socket(addr: SocketAddr, net_ns: NetNS) -> Result<TcpListener, Error> {
+    let _g = net_ns.guard();
+    let socket2_socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    setup_sokcet2(&socket2_socket, &addr)?;
+
+    let socket = TcpSocket::from_std_stream(socket2_socket.into());
+
+    if let Err(e) = socket.set_nodelay(true) {
+        tracing::warn!(?e, "set_nodelay fail in listen");
+    }
+
+    Ok(socket.listen(1024)?)
+}
+
+fn bind_udp_socket(addr: SocketAddr, net_ns: NetNS) -> Result<UdpSocket, Error> {
+    let _g = net_ns.guard();
+    let socket2_socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+
+    setup_sokcet2(&socket2_socket, &addr)?;
+
+    Ok(UdpSocket::from_std(socket2_socket.into())?)
+}
+
 struct Socks5ServerNet {
     ipv4_addr: cidr::Ipv4Inet,
     auth: Option<SimpleUserPassword>,
@@ -398,6 +433,8 @@ pub struct Socks5Server {
     udp_forward_task: Arc<DashMap<UdpClientKey, ScopedTask<()>>>,
 
     kcp_endpoint: Mutex<Option<Weak<KcpEndpoint>>>,
+
+    cancel_tokens: DashMap<PortForwardConfig, DropGuard>,
 }
 
 #[async_trait::async_trait]
@@ -497,6 +534,8 @@ impl Socks5Server {
             udp_forward_task: Arc::new(DashMap::new()),
 
             kcp_endpoint: Mutex::new(None),
+
+            cancel_tokens: DashMap::new(),
         })
     }
 
@@ -555,10 +594,10 @@ impl Socks5Server {
                 proxy_url.port().unwrap()
             );
 
-            let listener = {
-                let _g = self.global_ctx.net_ns.guard();
-                TcpListener::bind(bind_addr.parse::<SocketAddr>().unwrap()).await?
-            };
+            let listener = bind_tcp_socket(
+                bind_addr.parse::<SocketAddr>().unwrap(),
+                self.global_ctx.net_ns.clone(),
+            )?;
 
             let net = self.net.clone();
             self.tasks.lock().unwrap().spawn(async move {
@@ -580,10 +619,9 @@ impl Socks5Server {
             need_start = true;
         };
 
-        for port_forward in self.global_ctx.config.get_port_forwards() {
-            self.add_port_forward(port_forward).await?;
-            need_start = true;
-        }
+        let cfgs = self.global_ctx.config.get_port_forwards();
+        self.reload_port_forwards(&cfgs).await?;
+        need_start = need_start || cfgs.len() > 0;
 
         if need_start {
             self.peer_manager
@@ -593,6 +631,26 @@ impl Socks5Server {
             self.run_net_update_task().await;
         }
 
+        Ok(())
+    }
+
+    pub async fn reload_port_forwards(&self, cfgs: &Vec<PortForwardConfig>) -> Result<(), Error> {
+        // remove entries not in new cfg
+        self.cancel_tokens.retain(|k, _| {
+            cfgs.iter().any(|cfg| {
+                if cfg.dst_addr.ip().is_unspecified() {
+                    k.bind_addr == cfg.bind_addr && k.proto == cfg.proto
+                } else {
+                    k == cfg
+                }
+            })
+        });
+        // add new ones
+        for cfg in cfgs {
+            if !self.cancel_tokens.contains_key(cfg) {
+                self.add_port_forward(cfg.clone()).await?;
+            }
+        }
         Ok(())
     }
 
@@ -626,12 +684,10 @@ impl Socks5Server {
     pub async fn add_port_forward(&self, cfg: PortForwardConfig) -> Result<(), Error> {
         match cfg.proto.to_lowercase().as_str() {
             "tcp" => {
-                self.add_tcp_port_forward(cfg.bind_addr, cfg.dst_addr)
-                    .await?;
+                self.add_tcp_port_forward(&cfg).await?;
             }
             "udp" => {
-                self.add_udp_port_forward(cfg.bind_addr, cfg.dst_addr)
-                    .await?;
+                self.add_udp_port_forward(&cfg).await?;
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -646,15 +702,13 @@ impl Socks5Server {
         Ok(())
     }
 
-    pub async fn add_tcp_port_forward(
-        &self,
-        bind_addr: SocketAddr,
-        dst_addr: SocketAddr,
-    ) -> Result<(), Error> {
-        let listener = {
-            let _g = self.global_ctx.net_ns.guard();
-            TcpListener::bind(bind_addr).await?
-        };
+    pub fn remove_port_forward(&self, cfg: PortForwardConfig) {
+        let _ = self.cancel_tokens.remove(&cfg);
+    }
+
+    pub async fn add_tcp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+        let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
+        let listener = bind_tcp_socket(bind_addr, self.global_ctx.net_ns.clone())?;
 
         let net = self.net.clone();
         let entries = self.entries.clone();
@@ -662,14 +716,26 @@ impl Socks5Server {
         let forward_tasks = tasks.clone();
         let kcp_endpoint = self.kcp_endpoint.lock().await.clone();
         let peer_mgr = Arc::downgrade(&self.peer_manager.clone());
+        let cancel_token = CancellationToken::new();
+        self.cancel_tokens
+            .insert(cfg.clone(), cancel_token.clone().drop_guard());
 
         self.tasks.lock().unwrap().spawn(async move {
             loop {
-                let (incoming_socket, addr) = match listener.accept().await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::error!("port forward accept error = {:?}", err);
-                        continue;
+                let (incoming_socket, addr) = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("port forward for {:?} cancelled", bind_addr);
+                        break;
+                    }
+                    res = listener.accept() => {
+                        match res {
+                            Ok(result) => result,
+                            Err(err) => {
+                                tracing::error!("port forward accept error = {:?}", err);
+                                continue;
+                            }
+                        }
                     }
                 };
 
@@ -716,31 +782,37 @@ impl Socks5Server {
     }
 
     #[tracing::instrument(name = "add_udp_port_forward", skip(self))]
-    pub async fn add_udp_port_forward(
-        &self,
-        bind_addr: SocketAddr,
-        dst_addr: SocketAddr,
-    ) -> Result<(), Error> {
-        let socket = {
-            let _g = self.global_ctx.net_ns.guard();
-            Arc::new(UdpSocket::bind(bind_addr).await?)
-        };
+    pub async fn add_udp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+        let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
+        let socket = Arc::new(bind_udp_socket(bind_addr, self.global_ctx.net_ns.clone())?);
 
         let entries = self.entries.clone();
         let net_ns = self.global_ctx.net_ns.clone();
         let net = self.net.clone();
         let udp_client_map = self.udp_client_map.clone();
         let udp_forward_task = self.udp_forward_task.clone();
+        let cancel_token = CancellationToken::new();
+        self.cancel_tokens
+            .insert(cfg.clone(), cancel_token.clone().drop_guard());
 
         self.tasks.lock().unwrap().spawn(async move {
             loop {
                 // we set the max buffer size of smoltcp to 8192, so we need to use a buffer size that is less than 8192 here.
                 let mut buf = vec![0u8; 8192];
-                let (len, addr) = match socket.recv_from(&mut buf).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::error!("udp port forward recv error = {:?}", err);
-                        continue;
+                let (len, addr) = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("udp port forward for {:?} cancelled", bind_addr);
+                        break;
+                    }
+                    res = socket.recv_from(&mut buf) => {
+                        match res {
+                            Ok(result) => result,
+                            Err(err) => {
+                                tracing::error!("udp port forward recv error = {:?}", err);
+                                continue;
+                            }
+                        }
                     }
                 };
 

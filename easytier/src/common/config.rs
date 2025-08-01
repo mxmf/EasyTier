@@ -10,7 +10,10 @@ use cidr::IpCidr;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    proto::common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
+    proto::{
+        acl::Acl,
+        common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
+    },
     tunnel::generate_digest_from_str,
 };
 
@@ -115,6 +118,15 @@ pub trait ConfigLoader: Send + Sync {
 
     fn get_port_forwards(&self) -> Vec<PortForwardConfig>;
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
+
+    fn get_acl(&self) -> Option<Acl>;
+    fn set_acl(&self, acl: Option<Acl>);
+
+    fn get_tcp_whitelist(&self) -> Vec<String>;
+    fn set_tcp_whitelist(&self, whitelist: Vec<String>);
+
+    fn get_udp_whitelist(&self) -> Vec<String>;
+    fn set_udp_whitelist(&self, whitelist: Vec<String>);
 
     fn dump(&self) -> String;
 }
@@ -224,7 +236,7 @@ pub struct VpnPortalConfig {
     pub wireguard_listen: SocketAddr,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct PortForwardConfig {
     pub bind_addr: SocketAddr,
     pub dst_addr: SocketAddr,
@@ -291,6 +303,11 @@ struct Config {
 
     #[serde(skip)]
     flags_struct: Option<Flags>,
+
+    acl: Option<Acl>,
+
+    tcp_whitelist: Option<Vec<String>>,
+    udp_whitelist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +664,40 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>) {
         self.config.lock().unwrap().port_forward = Some(forwards);
+    }
+
+    fn get_acl(&self) -> Option<Acl> {
+        self.config.lock().unwrap().acl.clone()
+    }
+
+    fn set_acl(&self, acl: Option<Acl>) {
+        self.config.lock().unwrap().acl = acl;
+    }
+
+    fn get_tcp_whitelist(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .tcp_whitelist
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn set_tcp_whitelist(&self, whitelist: Vec<String>) {
+        self.config.lock().unwrap().tcp_whitelist = Some(whitelist);
+    }
+
+    fn get_udp_whitelist(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .udp_whitelist
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn set_udp_whitelist(&self, whitelist: Vec<String>) {
+        self.config.lock().unwrap().udp_whitelist = Some(whitelist);
     }
 
     fn dump(&self) -> String {
